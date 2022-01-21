@@ -700,7 +700,7 @@ fi
 CPPFLAGS=$CFLAGS
 
 CONFIGURE_FLAGS="
-    --build=${BUILD_TRIPLE} \
+    --build=${BUILD_TRIPLE}
     --host=${TARGET_TRIPLE}
     --prefix=/install
     --with-openssl=${TOOLS_PATH}/deps
