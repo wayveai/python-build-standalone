@@ -23,6 +23,12 @@ tar -xf Python-${PYTHON_VERSION}.tar.xz
 
 PIP_WHEEL="${ROOT}/pip-${PIP_VERSION}-py3-none-any.whl"
 SETUPTOOLS_WHEEL="${ROOT}/setuptools-${SETUPTOOLS_VERSION}-py3-none-any.whl"
+NUMPY_WHEEL="numpy==1.21.2"
+TYPING_EXTENSION_WHEELS="typing-extensions==3.10.0.2"
+TORCH_WHEEL="https://wayve-data.s3.eu-west-2.amazonaws.com/public/installers/torch-1.9.0-0.py38.cuda110.nompi.mkl202004912.py3-none-manylinux2014_x86_64.whl#egg=torch"
+PILLOW_WHEEL="pillow==9.0.0"
+TORCHVISION_WHEEL="https://wayve-data.s3.eu-west-2.amazonaws.com/public/installers/torchvision-0.10.0-0.py38.cuda110.mkl202004912.py3-none-manylinux2014_x86_64.whl#egg=torchvision"
+
 
 # pip and setuptools don't properly handle the case where the current executable
 # isn't dynamic. This is tracked by https://github.com/pypa/pip/issues/6543.
@@ -903,6 +909,11 @@ fi
 
 ${BUILD_PYTHON} "${PIP_WHEEL}/pip" install --prefix="${ROOT}/out/python/install" --no-cache-dir --no-index "${PIP_WHEEL}"
 ${BUILD_PYTHON} "${PIP_WHEEL}/pip" install --prefix="${ROOT}/out/python/install" --no-cache-dir --no-index "${SETUPTOOLS_WHEEL}"
+${BUILD_PYTHON} "${PIP_WHEEL}/pip" install --prefix="${ROOT}/out/python/install" --no-cache-dir "${NUMPY_WHEEL}"
+${BUILD_PYTHON} "${PIP_WHEEL}/pip" install --prefix="${ROOT}/out/python/install" --no-cache-dir "${TYPING_EXTENSION_WHEELS}"
+${BUILD_PYTHON} "${PIP_WHEEL}/pip" install --prefix="${ROOT}/out/python/install" --no-cache-dir "${PILLOW_WHEEL}"
+${BUILD_PYTHON} "${PIP_WHEEL}/pip" install --prefix="${ROOT}/out/python/install" --no-cache-dir --no-index "${TORCH_WHEEL}"
+${BUILD_PYTHON} "${PIP_WHEEL}/pip" install --prefix="${ROOT}/out/python/install" --no-cache-dir --no-index "${TORCHVISION_WHEEL}"
 
 # Emit metadata to be used in PYTHON.json.
 cat > ${ROOT}/generate_metadata.py << EOF
@@ -913,7 +924,7 @@ import json
 import os
 import sys
 import sysconfig
-
+    
 # When doing cross builds, sysconfig still picks up abiflags from the
 # host Python, which is never built in debug mode. Patch abiflags accordingly.
 if os.environ.get("CPYTHON_DEBUG") and "d" not in sysconfig.get_config_var("abiflags"):
