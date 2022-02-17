@@ -98,11 +98,17 @@ def add_target_env(env, build_platform, target_triple, build_env):
     if build_platform == "linux64":
         env["BUILD_TRIPLE"] = "x86_64-unknown-linux-gnu"
 
-        # TODO should the musl target be normalized?
-        env["TARGET_TRIPLE"] = target_triple.replace(
-            "-unknown-linux-musl", "-unknown-linux-gnu"
+        env["TARGET_TRIPLE"] = (
+            target_triple.replace("x86_64_v2-", "x86_64-")
+            .replace("x86_64_v3-", "x86_64-")
+            .replace("x86_64_v4-", "x86_64-")
+            # TODO should the musl target be normalized?
+            .replace("-unknown-linux-musl", "-unknown-linux-gnu")
         )
 
+        # This will make x86_64_v2, etc count as cross-compiling. This is
+        # semantically correct, since the current machine may not support
+        # instructions on the target machine type.
         if env["BUILD_TRIPLE"] != target_triple or target_triple.endswith(
             "-unknown-linux-musl"
         ):
@@ -294,6 +300,7 @@ def build_gcc(client, image, host_platform):
             build_env.copy_file(a)
 
         build_env.copy_file(toolchain_archive_path("binutils", host_platform))
+        build_env.copy_file(SUPPORT / "sccache-wrapper.sh")
         build_env.copy_file(SUPPORT / "build-gcc.sh")
 
         env = {
