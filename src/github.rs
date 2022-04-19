@@ -3,67 +3,76 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 use {
+    crate::release::{produce_install_only, RELEASE_TRIPLES},
     anyhow::{anyhow, Result},
     clap::ArgMatches,
-    octocrab::OctocrabBuilder,
-    once_cell::sync::Lazy,
-    serde::Deserialize,
+    futures::StreamExt,
+    octocrab::{
+        models::{repos::Release, workflows::WorkflowListArtifact},
+        Octocrab, OctocrabBuilder,
+    },
+    rayon::prelude::*,
+    sha2::{Digest, Sha256},
     std::{
-        collections::{BTreeMap, BTreeSet},
+        collections::{BTreeMap, BTreeSet, HashMap},
         io::Read,
         path::PathBuf,
     },
     zip::ZipArchive,
 };
 
-static SUFFIXES_BY_TRIPLE: Lazy<BTreeMap<&'static str, Vec<&'static str>>> = Lazy::new(|| {
-    let mut h = BTreeMap::new();
+async fn fetch_artifact(client: &Octocrab, artifact: WorkflowListArtifact) -> Result<bytes::Bytes> {
+    println!("downloading {}", artifact.name);
+    let res = client
+        .execute(client.request_builder(artifact.archive_download_url, reqwest::Method::GET))
+        .await?;
 
-    // macOS.
-    let macos_suffixes = vec!["debug", "lto", "pgo", "pgo+lto", "install_only"];
-    h.insert("aarch64-apple-darwin", macos_suffixes.clone());
-    h.insert("x86_64-apple-darwin", macos_suffixes);
-
-    // Windows.
-    let windows_suffixes = vec!["shared-pgo", "static-noopt", "shared-install_only"];
-    h.insert("i686-pc-windows-msvc", windows_suffixes.clone());
-    h.insert("x86_64-pc-windows-msvc", windows_suffixes);
-
-    // Linux.
-    let linux_suffixes_pgo = vec!["debug", "lto", "pgo", "pgo+lto", "install_only"];
-    let linux_suffixes_nopgo = vec!["debug", "lto", "noopt", "install_only"];
-
-    h.insert("aarch64-unknown-linux-gnu", linux_suffixes_nopgo.clone());
-
-    h.insert("i686-unknown-linux-gnu", linux_suffixes_pgo.clone());
-
-    h.insert("x86_64-unknown-linux-gnu", linux_suffixes_pgo.clone());
-    h.insert("x86_64-unknown-linux-musl", linux_suffixes_nopgo.clone());
-
-    h
-});
-
-#[derive(Clone, Debug, Deserialize)]
-struct Artifact {
-    archive_download_url: String,
-    created_at: String,
-    expired: bool,
-    expires_at: String,
-    id: u64,
-    name: String,
-    node_id: String,
-    size_in_bytes: u64,
-    updated_at: String,
-    url: String,
+    Ok(res.bytes().await?)
 }
 
-#[derive(Clone, Debug, Deserialize)]
-struct Artifacts {
-    artifacts: Vec<Artifact>,
-    total_count: u64,
+async fn upload_release_artifact(
+    client: &Octocrab,
+    release: &Release,
+    filename: &str,
+    data: Vec<u8>,
+    dry_run: bool,
+) -> Result<()> {
+    if release.assets.iter().any(|asset| asset.name == filename) {
+        println!("release asset {} already present; skipping", filename);
+        return Ok(());
+    }
+
+    let mut url = release.upload_url.clone();
+    let path = url.path().to_string();
+
+    if let Some(path) = path.strip_suffix("%7B") {
+        url.set_path(path);
+    }
+
+    url.query_pairs_mut().clear().append_pair("name", filename);
+
+    println!("uploading to {}", url);
+
+    let request = client
+        .request_builder(url, reqwest::Method::POST)
+        .header("Content-Length", data.len())
+        .header("Content-Type", "application/x-tar")
+        .body(data);
+
+    if dry_run {
+        return Ok(());
+    }
+
+    let response = client.execute(request).await?;
+
+    if !response.status().is_success() {
+        return Err(anyhow!("HTTP {}", response.status()));
+    }
+
+    Ok(())
 }
 
-pub async fn command_fetch_release_distributions(args: &ArgMatches<'_>) -> Result<()> {
+pub async fn command_fetch_release_distributions(args: &ArgMatches) -> Result<()> {
     let dest_dir = PathBuf::from(args.value_of("dest").expect("dest directory should be set"));
     let org = args
         .value_of("organization")
@@ -80,12 +89,18 @@ pub async fn command_fetch_release_distributions(args: &ArgMatches<'_>) -> Resul
 
     let workflows = client.workflows(org, repo);
 
+    let mut workflow_names = HashMap::new();
+
     let workflow_ids = workflows
         .list()
         .send()
         .await?
         .into_iter()
-        .map(|wf| wf.id)
+        .map(|wf| {
+            workflow_names.insert(wf.id.clone(), wf.name);
+
+            wf.id
+        })
         .collect::<Vec<_>>();
 
     let mut runs: Vec<octocrab::models::workflows::Run> = vec![];
@@ -102,43 +117,50 @@ pub async fn command_fetch_release_distributions(args: &ArgMatches<'_>) -> Resul
                 .find(|run| {
                     run.head_sha == args.value_of("commit").expect("commit should be defined")
                 })
-                .ok_or_else(|| anyhow!("could not find workflow run for commit"))?,
+                .ok_or_else(|| {
+                    anyhow!(
+                        "could not find workflow run for commit for workflow {}",
+                        workflow_names
+                            .get(&workflow_id)
+                            .expect("should have workflow name")
+                    )
+                })?,
         );
     }
 
     let mut fs = vec![];
 
     for run in runs {
-        let res = client
-            .execute(client.request_builder(run.artifacts_url, reqwest::Method::GET))
+        let page = client
+            .actions()
+            .list_workflow_run_artifacts(org, repo, run.id)
+            .send()
             .await?;
 
-        if !res.status().is_success() {
-            return Err(anyhow!("non-HTTP 200 fetching artifacts"));
-        }
+        let artifacts = client
+            .all_pages::<octocrab::models::workflows::WorkflowListArtifact>(
+                page.value.expect("untagged request should have page"),
+            )
+            .await?;
 
-        let artifacts: Artifacts = res.json().await?;
-
-        for artifact in artifacts.artifacts {
+        for artifact in artifacts {
             if matches!(
                 artifact.name.as_str(),
                 "pythonbuild" | "sccache" | "toolchain"
-            ) {
+            ) || artifact.name.contains("install-only")
+            {
                 continue;
             }
 
-            println!("downloading {}", artifact.name);
-            let res = client
-                .execute(
-                    client.request_builder(artifact.archive_download_url, reqwest::Method::GET),
-                )
-                .await?;
-
-            fs.push(res.bytes());
+            fs.push(fetch_artifact(&client, artifact));
         }
     }
 
-    for res in futures::future::join_all(fs).await {
+    let mut buffered = futures::stream::iter(fs).buffer_unordered(4);
+
+    let mut install_paths = vec![];
+
+    while let Some(res) = buffered.next().await {
         let data = res?;
 
         let mut za = ZipArchive::new(std::io::Cursor::new(data))?;
@@ -147,22 +169,46 @@ pub async fn command_fetch_release_distributions(args: &ArgMatches<'_>) -> Resul
 
             let name = zf.name().to_string();
 
-            if let Some(suffixes) = SUFFIXES_BY_TRIPLE.iter().find_map(|(triple, suffixes)| {
+            if let Some((triple, release)) = RELEASE_TRIPLES.iter().find_map(|(triple, release)| {
                 if name.contains(triple) {
-                    Some(suffixes)
+                    Some((triple, release))
                 } else {
                     None
                 }
             }) {
-                if suffixes.iter().any(|suffix| name.contains(suffix)) {
-                    let dest_path = dest_dir.join(&name);
-                    let mut buf = vec![];
-                    zf.read_to_end(&mut buf)?;
-                    std::fs::write(&dest_path, &buf)?;
-
-                    println!("releasing {}", name);
+                let stripped_name = if let Some(s) = name.strip_suffix(".tar.zst") {
+                    s
                 } else {
+                    println!("{} not a .tar.zst artifact", name);
+                    continue;
+                };
+
+                let stripped_name = &stripped_name[0..stripped_name.len() - "-YYYYMMDDTHHMM".len()];
+
+                let triple_start = stripped_name
+                    .find(triple)
+                    .expect("validated triple presence above");
+
+                let build_suffix = &stripped_name[triple_start + triple.len() + 1..];
+
+                if !release
+                    .suffixes
+                    .iter()
+                    .any(|suffix| build_suffix == *suffix)
+                {
                     println!("{} not a release artifact for triple", name);
+                    continue;
+                }
+
+                let dest_path = dest_dir.join(&name);
+                let mut buf = vec![];
+                zf.read_to_end(&mut buf)?;
+                std::fs::write(&dest_path, &buf)?;
+
+                println!("releasing {}", name);
+
+                if build_suffix == release.install_only_suffix {
+                    install_paths.push(dest_path);
                 }
             } else {
                 println!("{} does not match any registered release triples", name);
@@ -170,10 +216,33 @@ pub async fn command_fetch_release_distributions(args: &ArgMatches<'_>) -> Resul
         }
     }
 
+    install_paths
+        .par_iter()
+        .try_for_each(|path| -> Result<()> {
+            println!(
+                "producing install_only archive from {}",
+                path.file_name()
+                    .expect("should have file name")
+                    .to_string_lossy()
+            );
+
+            let dest_path = produce_install_only(&path)?;
+
+            println!(
+                "releasing {}",
+                dest_path
+                    .file_name()
+                    .expect("should have file name")
+                    .to_string_lossy()
+            );
+
+            Ok(())
+        })?;
+
     Ok(())
 }
 
-pub async fn command_upload_release_distributions(args: &ArgMatches<'_>) -> Result<()> {
+pub async fn command_upload_release_distributions(args: &ArgMatches) -> Result<()> {
     let dist_dir = PathBuf::from(args.value_of("dist").expect("dist should be specified"));
     let datetime = args
         .value_of("datetime")
@@ -188,6 +257,7 @@ pub async fn command_upload_release_distributions(args: &ArgMatches<'_>) -> Resu
         .value_of("organization")
         .expect("organization should be specified");
     let repo = args.value_of("repo").expect("repo should be specified");
+    let dry_run = args.is_present("dry_run");
 
     let mut filenames = std::fs::read_dir(&dist_dir)?
         .into_iter()
@@ -213,25 +283,44 @@ pub async fn command_upload_release_distributions(args: &ArgMatches<'_>) -> Resu
         python_versions.insert(parts[1]);
     }
 
-    let mut wanted_filenames = BTreeSet::new();
+    let mut wanted_filenames = BTreeMap::new();
     for version in python_versions {
-        for (triple, suffixes) in SUFFIXES_BY_TRIPLE.iter() {
-            for suffix in suffixes {
-                let extension = if suffix.contains("install_only") {
-                    "tar.gz"
-                } else {
-                    "tar.zst"
-                };
-
-                wanted_filenames.insert(format!(
-                    "cpython-{}-{}-{}-{}.{}",
-                    version, triple, suffix, datetime, extension
-                ));
+        for (triple, release) in RELEASE_TRIPLES.iter() {
+            if let Some(req) = &release.python_version_requirement {
+                let python_version = semver::Version::parse(version)?;
+                if !req.matches(&python_version) {
+                    continue;
+                }
             }
+
+            for suffix in &release.suffixes {
+                wanted_filenames.insert(
+                    format!(
+                        "cpython-{}-{}-{}-{}.tar.zst",
+                        version, triple, suffix, datetime
+                    ),
+                    format!(
+                        "cpython-{}+{}-{}-{}-full.tar.zst",
+                        version, tag, triple, suffix
+                    ),
+                );
+            }
+
+            wanted_filenames.insert(
+                format!(
+                    "cpython-{}-{}-install_only-{}.tar.gz",
+                    version, triple, datetime
+                ),
+                format!("cpython-{}+{}-{}-install_only.tar.gz", version, tag, triple),
+            );
         }
     }
 
-    let missing = wanted_filenames.difference(&filenames).collect::<Vec<_>>();
+    let missing = wanted_filenames
+        .keys()
+        .filter(|x| !filenames.contains(*x))
+        .collect::<Vec<_>>();
+
     for f in &missing {
         println!("missing release artifact: {}", f);
     }
@@ -252,35 +341,49 @@ pub async fn command_upload_release_distributions(args: &ArgMatches<'_>) -> Resu
         ));
     };
 
-    for filename in wanted_filenames.intersection(&filenames) {
-        let path = dist_dir.join(filename);
-        let file_data = std::fs::read(&path)?;
+    let mut digests = BTreeMap::new();
 
-        let mut url = release.upload_url.clone();
-        let path = url.path().to_string();
-
-        if let Some(path) = path.strip_suffix("%7B") {
-            url.set_path(path);
+    for (source, dest) in wanted_filenames {
+        if !filenames.contains(&source) {
+            continue;
         }
 
-        url.query_pairs_mut()
-            .clear()
-            .append_pair("name", filename.as_str());
+        let file_data = std::fs::read(dist_dir.join(&source))?;
 
-        println!("uploading {} to {}", filename, url);
+        let mut digest = Sha256::new();
+        digest.update(&file_data);
 
-        let request = client
-            .request_builder(url, reqwest::Method::POST)
-            .header("Content-Length", file_data.len())
-            .header("Content-Type", "application/x-tar")
-            .body(file_data);
+        let digest = hex::encode(digest.finalize());
 
-        let response = client.execute(request).await?;
+        digests.insert(dest.clone(), digest.clone());
 
-        if !response.status().is_success() {
-            return Err(anyhow!("HTTP {}", response.status()));
-        }
+        upload_release_artifact(&client, &release, &dest, file_data, dry_run).await?;
+        upload_release_artifact(
+            &client,
+            &release,
+            &format!("{}.sha256", dest),
+            format!("{}\n", digest).into_bytes(),
+            dry_run,
+        )
+        .await?;
     }
+
+    let shasums = digests
+        .iter()
+        .map(|(filename, digest)| format!("{}  {}\n", digest, filename))
+        .collect::<Vec<_>>()
+        .join("");
+
+    std::fs::write(dist_dir.join("SHA256SUMS"), shasums.as_bytes())?;
+
+    upload_release_artifact(
+        &client,
+        &release,
+        "SHA256SUMS",
+        shasums.into_bytes(),
+        dry_run,
+    )
+    .await?;
 
     Ok(())
 }

@@ -110,7 +110,7 @@ class TestPythonInterpreter(unittest.TestCase):
     def test_sqlite(self):
         import sqlite3
 
-        self.assertEqual(sqlite3.sqlite_version_info, (3, 37, 2))
+        self.assertEqual(sqlite3.sqlite_version_info, (3, 38, 1))
 
     def test_ssl(self):
         import ssl
@@ -120,7 +120,7 @@ class TestPythonInterpreter(unittest.TestCase):
         self.assertTrue(ssl.HAS_TLSv1_2)
         self.assertTrue(ssl.HAS_TLSv1_3)
 
-        self.assertEqual(ssl.OPENSSL_VERSION_INFO, (1, 1, 1, 13, 15))
+        self.assertEqual(ssl.OPENSSL_VERSION_INFO, (1, 1, 1, 14, 15))
 
         ssl.create_default_context()
 

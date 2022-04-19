@@ -2,7 +2,7 @@ on:
   push:
   pull_request:
   schedule:
-    - cron: '13 15 * * *'
+    - cron: '13 11 * * *'
 jobs:
   # We need to build our own sccache until e6326bc8a20ee06af37e16a3a7a14e3374c66c66
   # is in a released version.
@@ -539,38 +539,3 @@ jobs:
         with:
           name: ${{ matrix.build.py }}-${{ matrix.build.target_triple }}
           path: dist/*
-
-  install-only:
-    strategy:
-      fail-fast: false
-      matrix:
-        version:
-          - '3.9'
-          - '3.10'
-    needs:
-      - build
-    runs-on: 'ubuntu-20.04'
-    steps:
-      - uses: actions/checkout@v2
-        with:
-          fetch-depth: 0
-
-      - name: Install Python
-        uses: actions/setup-python@v2
-        with:
-          python-version: '3.9'
-
-      - name: Download Python
-        uses: actions/download-artifact@v2
-        with:
-          name: 'cpython-${{ matrix.version }}-x86_64-unknown-linux-gnu'
-
-      - name: Repack Distribution
-        run: |
-          ./prune-distribution.py cpython-*-pgo+lto-*
-
-      - name: Upload Distribution
-        uses: actions/upload-artifact@v2
-        with:
-          name: 'cpython-${{ matrix.version }}-install-only'
-          path: cpython-*.tar.gz
